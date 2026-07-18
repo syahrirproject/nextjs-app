@@ -1,0 +1,136 @@
+name: CI/CD Pipeline - Next.js App
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  static-analysis:
+    name: Code Static Analysis Inspection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ESLint
+        run: npm run lint
+      - name: Run TypeScript Check
+        run: npm run type-check
+
+  unit-test:
+    name: Unit Test
+    runs-on: ubuntu-latest
+    needs: static-analysis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Run Unit Tests (Jest)
+        run: npm run test:unit -- --coverage
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: unit-test
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Run Integration Tests
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+
+  e2e-test:
+    name: End to End Test
+    runs-on: ubuntu-latest
+    needs: integration-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+      - name: Build Application
+        run: npm run build
+      - name: Run E2E Tests
+        run: npm run test:e2e
+
+  build-image:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    needs: e2e-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and Push Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/nextjs-app:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/nextjs-app:latest
+
+  deploy:
+    name: Deploy to WSL (Self-Hosted Runner)
+    runs-on: self-hosted
+    needs: build-image
+    steps:
+      - name: Pull Latest Image
+        run: docker pull ${{ secrets.DOCKERHUB_USERNAME }}/nextjs-app:latest
+      - name: Stop & Remove Old Container
+        run: |
+          docker stop nextjs-app || true
+          docker rm nextjs-app || true
+      - name: Run New Container
+        run: |
+          docker run -d \
+            --name nextjs-app \
+            -p 3000:3000 \
+            --restart unless-stopped \
+            ${{ secrets.DOCKERHUB_USERNAME }}/nextjs-app:latest
+      - name: Health Check
+        run: |
+          sleep 5
+          curl -f http://localhost:3000 || exit 1
